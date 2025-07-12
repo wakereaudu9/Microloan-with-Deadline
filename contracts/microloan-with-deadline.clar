@@ -21,13 +21,14 @@
     amount: uint,
     deadline: uint,
     state: uint,
-    created-at: uint
+    created-at: uint,
+    interest-rate: uint
   }
 )
 
 (define-data-var next-loan-id uint u1)
 
-(define-public (create-loan (borrower principal) (amount uint) (deadline uint))
+(define-public (create-loan (borrower principal) (amount uint) (deadline uint) (interest-rate uint))
   (let
     (
       (loan-id (var-get next-loan-id))
@@ -35,6 +36,7 @@
     )
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (> deadline current-block) ERR_INVALID_DEADLINE)
+    (asserts! (<= interest-rate u10000) ERR_INVALID_AMOUNT)
     (asserts! (is-none (map-get? loans { loan-id: loan-id })) ERR_LOAN_ALREADY_EXISTS)
     
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
@@ -47,7 +49,8 @@
         amount: amount,
         deadline: deadline,
         state: LOAN_STATE_ACTIVE,
-        created-at: current-block
+        created-at: current-block,
+        interest-rate: interest-rate
       }
     )
     
@@ -78,7 +81,16 @@
     (asserts! (is-eq (get state loan-data) LOAN_STATE_ACTIVE) ERR_LOAN_NOT_ACTIVE)
     (asserts! (<= stacks-block-height (get deadline loan-data)) ERR_DEADLINE_NOT_REACHED)
     
-    (try! (stx-transfer? (get amount loan-data) tx-sender (get lender loan-data)))
+    (let
+      (
+        (principal-amount (get amount loan-data))
+        (rate (get interest-rate loan-data))
+        (blocks-elapsed (- stacks-block-height (get created-at loan-data)))
+        (interest-amount (/ (* principal-amount rate blocks-elapsed) u1000000))
+        (total-amount (+ principal-amount interest-amount))
+      )
+      (try! (stx-transfer? total-amount tx-sender (get lender loan-data)))
+    )
     
     (map-set loans
       { loan-id: loan-id }
@@ -180,11 +192,48 @@
         deadline: (get deadline loan-data),
         state: (get state loan-data),
         created-at: (get created-at loan-data),
+        interest-rate: (get interest-rate loan-data),
         blocks-remaining: (if (> (get deadline loan-data) stacks-block-height)
                            (- (get deadline loan-data) stacks-block-height)
                            u0),
-        is-overdue: (> stacks-block-height (get deadline loan-data))
+        is-overdue: (> stacks-block-height (get deadline loan-data)),
+        current-interest: (let
+          (
+            (principal-amount (get amount loan-data))
+            (rate (get interest-rate loan-data))
+            (blocks-elapsed (- stacks-block-height (get created-at loan-data)))
+          )
+          (/ (* principal-amount rate blocks-elapsed) u1000000)),
+        total-owed: (let
+          (
+            (principal-amount (get amount loan-data))
+            (rate (get interest-rate loan-data))
+            (blocks-elapsed (- stacks-block-height (get created-at loan-data)))
+            (interest-amount (/ (* principal-amount rate blocks-elapsed) u1000000))
+          )
+          (+ principal-amount interest-amount))
       })
+    ERR_LOAN_NOT_FOUND
+  )
+)
+
+(define-read-only (calculate-interest (loan-id uint))
+  (match (map-get? loans { loan-id: loan-id })
+    loan-data
+      (let
+        (
+          (principal-amount (get amount loan-data))
+          (rate (get interest-rate loan-data))
+          (blocks-elapsed (- stacks-block-height (get created-at loan-data)))
+          (interest-amount (/ (* principal-amount rate blocks-elapsed) u1000000))
+        )
+        (ok {
+          principal: principal-amount,
+          interest-rate: rate,
+          blocks-elapsed: blocks-elapsed,
+          interest-amount: interest-amount,
+          total-amount: (+ principal-amount interest-amount)
+        }))
     ERR_LOAN_NOT_FOUND
   )
 )
