@@ -22,8 +22,23 @@
     deadline: uint,
     state: uint,
     created-at: uint,
-    interest-rate: uint
+    interest-rate: uint,
+    amount-paid: uint
   }
+)
+
+(define-map payment-history
+  { loan-id: uint, payment-id: uint }
+  {
+    amount: uint,
+    timestamp: uint,
+    remaining-balance: uint
+  }
+)
+
+(define-map loan-payment-count
+  { loan-id: uint }
+  { count: uint }
 )
 
 (define-data-var next-loan-id uint u1)
@@ -50,10 +65,12 @@
         deadline: deadline,
         state: LOAN_STATE_ACTIVE,
         created-at: current-block,
-        interest-rate: interest-rate
+        interest-rate: interest-rate,
+        amount-paid: u0
       }
     )
     
+    (map-set loan-payment-count { loan-id: loan-id } { count: u0 })
     (var-set next-loan-id (+ loan-id u1))
     (ok loan-id)
   )
@@ -94,9 +111,72 @@
     
     (map-set loans
       { loan-id: loan-id }
-      (merge loan-data { state: LOAN_STATE_REPAID })
+      (merge loan-data { state: LOAN_STATE_REPAID, amount-paid: (get amount loan-data) })
     )
     (ok true)
+  )
+)
+
+(define-public (make-partial-payment (loan-id uint) (payment-amount uint))
+  (let
+    (
+      (loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (payment-count-data (unwrap! (map-get? loan-payment-count { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (current-payment-id (get count payment-count-data))
+    )
+    (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get state loan-data) LOAN_STATE_ACTIVE) ERR_LOAN_NOT_ACTIVE)
+    (asserts! (<= stacks-block-height (get deadline loan-data)) ERR_DEADLINE_NOT_REACHED)
+    (asserts! (> payment-amount u0) ERR_INVALID_AMOUNT)
+    
+    (let
+      (
+        (principal-amount (get amount loan-data))
+        (rate (get interest-rate loan-data))
+        (blocks-elapsed (- stacks-block-height (get created-at loan-data)))
+        (interest-amount (/ (* principal-amount rate blocks-elapsed) u1000000))
+        (total-owed (+ principal-amount interest-amount))
+        (amount-already-paid (get amount-paid loan-data))
+        (remaining-balance (- total-owed amount-already-paid))
+        (new-amount-paid (+ amount-already-paid payment-amount))
+        (new-remaining-balance (if (>= new-amount-paid total-owed) u0 (- total-owed new-amount-paid)))
+        (actual-payment (if (> payment-amount remaining-balance) remaining-balance payment-amount))
+      )
+      (asserts! (> remaining-balance u0) ERR_LOAN_ALREADY_REPAID)
+      
+      (try! (stx-transfer? actual-payment tx-sender (get lender loan-data)))
+      
+      (map-set payment-history
+        { loan-id: loan-id, payment-id: current-payment-id }
+        {
+          amount: actual-payment,
+          timestamp: stacks-block-height,
+          remaining-balance: new-remaining-balance
+        }
+      )
+      
+      (map-set loan-payment-count
+        { loan-id: loan-id }
+        { count: (+ current-payment-id u1) }
+      )
+      
+      (if (>= new-amount-paid total-owed)
+        (map-set loans
+          { loan-id: loan-id }
+          (merge loan-data { state: LOAN_STATE_REPAID, amount-paid: total-owed })
+        )
+        (map-set loans
+          { loan-id: loan-id }
+          (merge loan-data { amount-paid: new-amount-paid })
+        )
+      )
+      
+      (ok {
+        payment-amount: actual-payment,
+        remaining-balance: new-remaining-balance,
+        loan-fully-paid: (>= new-amount-paid total-owed)
+      })
+    )
   )
 )
 
@@ -193,6 +273,7 @@
         state: (get state loan-data),
         created-at: (get created-at loan-data),
         interest-rate: (get interest-rate loan-data),
+        amount-paid: (get amount-paid loan-data),
         blocks-remaining: (if (> (get deadline loan-data) stacks-block-height)
                            (- (get deadline loan-data) stacks-block-height)
                            u0),
@@ -211,8 +292,46 @@
             (blocks-elapsed (- stacks-block-height (get created-at loan-data)))
             (interest-amount (/ (* principal-amount rate blocks-elapsed) u1000000))
           )
-          (+ principal-amount interest-amount))
+          (+ principal-amount interest-amount)),
+        remaining-balance: (let
+          (
+            (principal-amount (get amount loan-data))
+            (rate (get interest-rate loan-data))
+            (blocks-elapsed (- stacks-block-height (get created-at loan-data)))
+            (interest-amount (/ (* principal-amount rate blocks-elapsed) u1000000))
+            (total-owed (+ principal-amount interest-amount))
+            (amount-paid (get amount-paid loan-data))
+          )
+          (if (>= amount-paid total-owed) u0 (- total-owed amount-paid)))
       })
+    ERR_LOAN_NOT_FOUND
+  )
+)
+
+(define-read-only (get-payment-history (loan-id uint) (payment-id uint))
+  (map-get? payment-history { loan-id: loan-id, payment-id: payment-id })
+)
+
+(define-read-only (get-payment-count (loan-id uint))
+  (match (map-get? loan-payment-count { loan-id: loan-id })
+    count-data (ok (get count count-data))
+    ERR_LOAN_NOT_FOUND
+  )
+)
+
+(define-read-only (get-remaining-balance (loan-id uint))
+  (match (map-get? loans { loan-id: loan-id })
+    loan-data
+      (let
+        (
+          (principal-amount (get amount loan-data))
+          (rate (get interest-rate loan-data))
+          (blocks-elapsed (- stacks-block-height (get created-at loan-data)))
+          (interest-amount (/ (* principal-amount rate blocks-elapsed) u1000000))
+          (total-owed (+ principal-amount interest-amount))
+          (amount-paid (get amount-paid loan-data))
+        )
+        (ok (if (>= amount-paid total-owed) u0 (- total-owed amount-paid))))
     ERR_LOAN_NOT_FOUND
   )
 )
