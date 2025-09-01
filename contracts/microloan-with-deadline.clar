@@ -8,6 +8,9 @@
 (define-constant ERR_LOAN_ALREADY_REPAID (err u106))
 (define-constant ERR_INVALID_AMOUNT (err u107))
 (define-constant ERR_INVALID_DEADLINE (err u108))
+(define-constant ERR_TRANSFER_NOT_FOUND (err u109))
+(define-constant ERR_TRANSFER_ALREADY_EXISTS (err u110))
+(define-constant ERR_INVALID_TRANSFER_PRICE (err u111))
 
 (define-constant LOAN_STATE_ACTIVE u1)
 (define-constant LOAN_STATE_REPAID u2)
@@ -37,6 +40,31 @@
 )
 
 (define-map loan-payment-count
+  { loan-id: uint }
+  { count: uint }
+)
+
+(define-map pending-transfers
+  { loan-id: uint }
+  {
+    current-lender: principal,
+    proposed-lender: principal,
+    transfer-price: uint,
+    expires-at: uint
+  }
+)
+
+(define-map transfer-history
+  { loan-id: uint, transfer-id: uint }
+  {
+    from-lender: principal,
+    to-lender: principal,
+    price: uint,
+    timestamp: uint
+  }
+)
+
+(define-map loan-transfer-count
   { loan-id: uint }
   { count: uint }
 )
@@ -71,6 +99,7 @@
     )
     
     (map-set loan-payment-count { loan-id: loan-id } { count: u0 })
+    (map-set loan-transfer-count { loan-id: loan-id } { count: u0 })
     (var-set next-loan-id (+ loan-id u1))
     (ok loan-id)
   )
@@ -308,6 +337,82 @@
   )
 )
 
+(define-public (initiate-loan-transfer (loan-id uint) (new-lender principal) (transfer-price uint) (expires-in-blocks uint))
+  (let
+    (
+      (loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (expiry-block (+ stacks-block-height expires-in-blocks))
+    )
+    (asserts! (is-eq (get lender loan-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get state loan-data) LOAN_STATE_ACTIVE) ERR_LOAN_NOT_ACTIVE)
+    (asserts! (> transfer-price u0) ERR_INVALID_TRANSFER_PRICE)
+    (asserts! (> expires-in-blocks u0) ERR_INVALID_DEADLINE)
+    (asserts! (is-none (map-get? pending-transfers { loan-id: loan-id })) ERR_TRANSFER_ALREADY_EXISTS)
+    
+    (map-set pending-transfers
+      { loan-id: loan-id }
+      {
+        current-lender: tx-sender,
+        proposed-lender: new-lender,
+        transfer-price: transfer-price,
+        expires-at: expiry-block
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (accept-loan-transfer (loan-id uint))
+  (let
+    (
+      (transfer-data (unwrap! (map-get? pending-transfers { loan-id: loan-id }) ERR_TRANSFER_NOT_FOUND))
+      (loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (transfer-count-data (unwrap! (map-get? loan-transfer-count { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (current-transfer-id (get count transfer-count-data))
+    )
+    (asserts! (is-eq (get proposed-lender transfer-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (<= stacks-block-height (get expires-at transfer-data)) ERR_DEADLINE_NOT_REACHED)
+    (asserts! (is-eq (get state loan-data) LOAN_STATE_ACTIVE) ERR_LOAN_NOT_ACTIVE)
+    
+    (try! (stx-transfer? (get transfer-price transfer-data) tx-sender (get current-lender transfer-data)))
+    
+    (map-set loans
+      { loan-id: loan-id }
+      (merge loan-data { lender: tx-sender })
+    )
+    
+    (map-set transfer-history
+      { loan-id: loan-id, transfer-id: current-transfer-id }
+      {
+        from-lender: (get current-lender transfer-data),
+        to-lender: tx-sender,
+        price: (get transfer-price transfer-data),
+        timestamp: stacks-block-height
+      }
+    )
+    
+    (map-set loan-transfer-count
+      { loan-id: loan-id }
+      { count: (+ current-transfer-id u1) }
+    )
+    
+    (map-delete pending-transfers { loan-id: loan-id })
+    (ok true)
+  )
+)
+
+(define-public (cancel-loan-transfer (loan-id uint))
+  (let
+    (
+      (transfer-data (unwrap! (map-get? pending-transfers { loan-id: loan-id }) ERR_TRANSFER_NOT_FOUND))
+    )
+    (asserts! (is-eq (get current-lender transfer-data) tx-sender) ERR_UNAUTHORIZED)
+    
+    (map-delete pending-transfers { loan-id: loan-id })
+    (ok true)
+  )
+)
+
 (define-read-only (get-payment-history (loan-id uint) (payment-id uint))
   (map-get? payment-history { loan-id: loan-id, payment-id: payment-id })
 )
@@ -354,5 +459,28 @@
           total-amount: (+ principal-amount interest-amount)
         }))
     ERR_LOAN_NOT_FOUND
+  )
+)
+
+(define-read-only (get-pending-transfer (loan-id uint))
+  (map-get? pending-transfers { loan-id: loan-id })
+)
+
+(define-read-only (get-transfer-history (loan-id uint) (transfer-id uint))
+  (map-get? transfer-history { loan-id: loan-id, transfer-id: transfer-id })
+)
+
+(define-read-only (get-transfer-count (loan-id uint))
+  (match (map-get? loan-transfer-count { loan-id: loan-id })
+    count-data (ok (get count count-data))
+    ERR_LOAN_NOT_FOUND
+  )
+)
+
+(define-read-only (is-transfer-expired (loan-id uint))
+  (match (map-get? pending-transfers { loan-id: loan-id })
+    transfer-data
+      (ok (> stacks-block-height (get expires-at transfer-data)))
+    ERR_TRANSFER_NOT_FOUND
   )
 )
