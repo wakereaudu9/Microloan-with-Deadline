@@ -11,6 +11,8 @@
 (define-constant ERR_TRANSFER_NOT_FOUND (err u109))
 (define-constant ERR_TRANSFER_ALREADY_EXISTS (err u110))
 (define-constant ERR_INVALID_TRANSFER_PRICE (err u111))
+(define-constant ERR_INSUFFICIENT_COLLATERAL (err u112))
+(define-constant ERR_COLLATERAL_ALREADY_CLAIMED (err u113))
 
 (define-constant LOAN_STATE_ACTIVE u1)
 (define-constant LOAN_STATE_REPAID u2)
@@ -26,7 +28,9 @@
     state: uint,
     created-at: uint,
     interest-rate: uint,
-    amount-paid: uint
+    amount-paid: uint,
+    collateral-amount: uint,
+    collateral-claimed: bool
   }
 )
 
@@ -94,7 +98,9 @@
         state: LOAN_STATE_ACTIVE,
         created-at: current-block,
         interest-rate: interest-rate,
-        amount-paid: u0
+        amount-paid: u0,
+        collateral-amount: u0,
+        collateral-claimed: false
       }
     )
     
@@ -114,6 +120,27 @@
     (asserts! (is-eq (get state loan-data) LOAN_STATE_ACTIVE) ERR_LOAN_NOT_ACTIVE)
     
     (try! (as-contract (stx-transfer? (get amount loan-data) tx-sender (get borrower loan-data))))
+    (ok true)
+  )
+)
+
+(define-public (fund-loan-with-collateral (loan-id uint) (collateral-amount uint))
+  (let
+    (
+      (loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+    )
+    (asserts! (is-eq (get lender loan-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get state loan-data) LOAN_STATE_ACTIVE) ERR_LOAN_NOT_ACTIVE)
+    (asserts! (> collateral-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq (get collateral-amount loan-data) u0) ERR_LOAN_ALREADY_EXISTS)
+    
+    (try! (stx-transfer? collateral-amount (get borrower loan-data) (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? (get amount loan-data) tx-sender (get borrower loan-data))))
+    
+    (map-set loans
+      { loan-id: loan-id }
+      (merge loan-data { collateral-amount: collateral-amount })
+    )
     (ok true)
   )
 )
@@ -138,9 +165,14 @@
       (try! (stx-transfer? total-amount tx-sender (get lender loan-data)))
     )
     
+    (if (> (get collateral-amount loan-data) u0)
+      (try! (as-contract (stx-transfer? (get collateral-amount loan-data) tx-sender (get borrower loan-data))))
+      true
+    )
+    
     (map-set loans
       { loan-id: loan-id }
-      (merge loan-data { state: LOAN_STATE_REPAID, amount-paid: (get amount loan-data) })
+      (merge loan-data { state: LOAN_STATE_REPAID, amount-paid: (get amount loan-data), collateral-claimed: false })
     )
     (ok true)
   )
@@ -218,9 +250,14 @@
     (asserts! (is-eq (get state loan-data) LOAN_STATE_ACTIVE) ERR_LOAN_NOT_ACTIVE)
     (asserts! (> stacks-block-height (get deadline loan-data)) ERR_DEADLINE_NOT_REACHED)
     
+    (if (and (> (get collateral-amount loan-data) u0) (not (get collateral-claimed loan-data)))
+      (try! (as-contract (stx-transfer? (get collateral-amount loan-data) tx-sender (get lender loan-data))))
+      true
+    )
+    
     (map-set loans
       { loan-id: loan-id }
-      (merge loan-data { state: LOAN_STATE_DEFAULTED })
+      (merge loan-data { state: LOAN_STATE_DEFAULTED, collateral-claimed: true })
     )
     (ok true)
   )
@@ -482,5 +519,28 @@
     transfer-data
       (ok (> stacks-block-height (get expires-at transfer-data)))
     ERR_TRANSFER_NOT_FOUND
+  )
+)
+
+(define-read-only (get-collateral-info (loan-id uint))
+  (match (map-get? loans { loan-id: loan-id })
+    loan-data
+      (ok {
+        collateral-amount: (get collateral-amount loan-data),
+        collateral-claimed: (get collateral-claimed loan-data),
+        has-collateral: (> (get collateral-amount loan-data) u0),
+        collateral-ratio: (if (> (get amount loan-data) u0)
+          (/ (* (get collateral-amount loan-data) u10000) (get amount loan-data))
+          u0)
+      })
+    ERR_LOAN_NOT_FOUND
+  )
+)
+
+(define-read-only (is-collateralized (loan-id uint))
+  (match (map-get? loans { loan-id: loan-id })
+    loan-data
+      (ok (> (get collateral-amount loan-data) u0))
+    ERR_LOAN_NOT_FOUND
   )
 )
