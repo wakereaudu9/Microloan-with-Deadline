@@ -13,6 +13,9 @@
 (define-constant ERR_INVALID_TRANSFER_PRICE (err u111))
 (define-constant ERR_INSUFFICIENT_COLLATERAL (err u112))
 (define-constant ERR_COLLATERAL_ALREADY_CLAIMED (err u113))
+(define-constant ERR_GRACE_ALREADY_EXISTS (err u114))
+(define-constant ERR_GRACE_NOT_FOUND (err u115))
+(define-constant ERR_INVALID_EXTENSION (err u116))
 
 (define-constant LOAN_STATE_ACTIVE u1)
 (define-constant LOAN_STATE_REPAID u2)
@@ -73,6 +76,16 @@
   { count: uint }
 )
 
+(define-map grace-requests
+  { loan-id: uint }
+  {
+    borrower: principal,
+    requested-extension: uint,
+    fee: uint,
+    expires-at: uint
+  }
+)
+
 (define-data-var next-loan-id uint u1)
 
 (define-public (create-loan (borrower principal) (amount uint) (deadline uint) (interest-rate uint))
@@ -108,6 +121,67 @@
     (map-set loan-transfer-count { loan-id: loan-id } { count: u0 })
     (var-set next-loan-id (+ loan-id u1))
     (ok loan-id)
+  )
+)
+
+(define-public (request-grace-extension (loan-id uint) (extension uint) (fee uint) (expires-in-blocks uint))
+  (let
+    (
+      (loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (expiry-block (+ stacks-block-height expires-in-blocks))
+    )
+    (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get state loan-data) LOAN_STATE_ACTIVE) ERR_LOAN_NOT_ACTIVE)
+    (asserts! (<= stacks-block-height (get deadline loan-data)) ERR_DEADLINE_NOT_REACHED)
+    (asserts! (> extension u0) ERR_INVALID_EXTENSION)
+    (asserts! (> fee u0) ERR_INVALID_AMOUNT)
+    (asserts! (> expires-in-blocks u0) ERR_INVALID_DEADLINE)
+    (asserts! (is-none (map-get? grace-requests { loan-id: loan-id })) ERR_GRACE_ALREADY_EXISTS)
+    (try! (stx-transfer? fee tx-sender (as-contract tx-sender)))
+    (map-set grace-requests
+      { loan-id: loan-id }
+      {
+        borrower: tx-sender,
+        requested-extension: extension,
+        fee: fee,
+        expires-at: expiry-block
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (approve-grace-extension (loan-id uint))
+  (let
+    (
+      (loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (grace-data (unwrap! (map-get? grace-requests { loan-id: loan-id }) ERR_GRACE_NOT_FOUND))
+      (new-deadline (+ (get deadline loan-data) (get requested-extension grace-data)))
+    )
+    (asserts! (is-eq (get lender loan-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get state loan-data) LOAN_STATE_ACTIVE) ERR_LOAN_NOT_ACTIVE)
+    (asserts! (<= stacks-block-height (get expires-at grace-data)) ERR_DEADLINE_NOT_REACHED)
+    (asserts! (> (get requested-extension grace-data) u0) ERR_INVALID_EXTENSION)
+    (map-set loans
+      { loan-id: loan-id }
+      (merge loan-data { deadline: new-deadline })
+    )
+    (try! (as-contract (stx-transfer? (get fee grace-data) tx-sender (get lender loan-data))))
+    (map-delete grace-requests { loan-id: loan-id })
+    (ok true)
+  )
+)
+
+(define-public (refund-expired-grace-request (loan-id uint))
+  (let
+    (
+      (grace-data (unwrap! (map-get? grace-requests { loan-id: loan-id }) ERR_GRACE_NOT_FOUND))
+    )
+    (asserts! (is-eq (get borrower grace-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> stacks-block-height (get expires-at grace-data)) ERR_DEADLINE_NOT_REACHED)
+    (try! (as-contract (stx-transfer? (get fee grace-data) tx-sender (get borrower grace-data))))
+    (map-delete grace-requests { loan-id: loan-id })
+    (ok true)
   )
 )
 
